@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Document</title>
+	<style>
+		body {
+			max-width: 800px;
+			margin: auto;
+		}
+	</style>
+	<link href="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.css" rel="stylesheet">
+	<script type="module">
+		const history = document.createElement('div');
+		const current_generation = document.createElement('div');
+		const input_area = document.createElement('textarea');
+		const status = document.createElement('span');
+		const reset_btn = document.createElement('button');
+		const stop_btn = document.createElement('button');
+		document.body.append(history, current_generation, input_area, status, ' ', reset_btn, ' ', stop_btn);
+
+		input_area.style.width = '100%';
+		reset_btn.textContent = 'Reset';
+		stop_btn.textContent = 'Stop';
+		stop_btn.disabled = true;
+
+		// https://github.com/ggml-org/llama.cpp/blob/master/tools/server/webui/src/lib/components/app/misc/MarkdownContent.svelte#L24
+		import { remark } from 'https://esm.sh/remark?bundle';
+		import remarkGfm from 'https://esm.sh/remark-gfm?bundle';
+		import remarkMath from 'https://esm.sh/remark-math?bundle';
+		import remarkBreaks from 'https://esm.sh/remark-breaks?bundle';
+		import remarkRehype from 'https://esm.sh/remark-rehype?bundle';
+		import rehypeKatex from 'https://esm.sh/rehype-katex?bundle';
+		import rehypeHighlight from 'https://esm.sh/rehype-highlight?bundle';
+		import rehypeStringify from 'https://esm.sh/rehype-stringify?bundle';
+		const processor = remark()
+			.use(remarkGfm) // GitHub Flavored Markdown
+			.use(remarkMath) // Parse $inline$ and $$block$$ math
+			.use(remarkBreaks) // Convert line breaks to <br>
+			.use(remarkRehype) // Convert to rehype (HTML AST)
+			.use(rehypeKatex) // Render math using KaTeX
+			.use(rehypeHighlight) // Add syntax highlighting
+			.use(rehypeStringify);
+		const md_to_html = async md => await processor.process(preprocessLaTeX(md));
+
+		const decoder = new TextDecoder('utf-8');
+
+		const get_n_ctx = async _ => fetch('/props').then(r => r.json()).then(j => j.default_generation_settings.n_ctx);
+		const draw = async mm => {
+			history.innerHTML = await Promise.all(mm.map(async m => `<h2>${m.role}</h2>${await md_to_html(m.content)}`)).then(a => a.join(''));
+			status.innerHTML = `${messages.reduce((s, m) => s + m.tokens, 0)}/${n_ctx} ${prediction_speed}tok/s`;
+			current_generation.innerHTML = '';
+		};
+
+		input_area.onkeydown = async e => {
+			if (e.key !== 'Enter' || e.shiftKey) return;
+
+			e.preventDefault();
+			const query = e.srcElement.value.trim();
+			if (!query) return;
+			messages.push({ role: 'user', content: query, tokens: await count_tokens(query) });
+			draw(messages);
+
+			input_area.style.backgroundColor = '#D3D3D3';
+			reset_btn.disabled = true;
+			stop_btn.disabled = false;
+			const prediction = await call_llm(messages);
+			input_area.style.backgroundColor = '';
+			reset_btn.disabled = false;
+			stop_btn.disabled = true;
+			if (prediction) {
+				messages.push(prediction);
+				e.srcElement.value = '';
+				draw(messages);
+			}
+		}
+
+		const count_tokens = async m => {
+			const response = await fetch('/tokenize', { method: 'POST', body: JSON.stringify({ content: m }) });
+			if (!response.ok) throw new Error('Network response was not ok');
+			return (await response.json()).tokens.length;
+		}
+
+		const call_llm = async m => {
+			const abort_controller = new AbortController();
+			stop_btn.onclick = _ => {
+				abort_controller.abort(new Error('Cancelled'));
+				messages.pop(); // remove aborted user input
+			}
+			try {
+				const response = await fetch('/v1/chat/completions', {
+					method: 'POST',
+					signal: abort_controller.signal,
+					body: JSON.stringify({ messages: m, stream: true, timings_per_token: true })
+				});
+				if (!response.ok) throw new Error('Network response was not ok');
+
+				n_ctx = await get_n_ctx();
+				const reader = response.body.getReader();
+
+				let predicted_str = '';
+				let predicted_n = 0;
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					for (const line of decoder.decode(value).split('\n')) {
+						console.log(line);
+						if (!line.startsWith('data:')) continue;
+						if (line === 'data: [DONE]') {
+							return { role: 'assistant', content: predicted_str, tokens: predicted_n };
+						}
+						const j = JSON.parse(line.slice(6));
+						const new_token = j.choices[0].delta.content;
+						if (new_token) {
+							prediction_speed = Number((j.timings || {}).predicted_per_second).toFixed(2);
+							predicted_n = (j.timings || {}).predicted_n;
+							predicted_str += new_token;
+							current_generation.innerHTML = '<h2>assistant</h2>' + await md_to_html(predicted_str);
+							status.innerHTML = `${m.reduce((s, m1) => s + m1.tokens, 0) + predicted_n}/${n_ctx} ${prediction_speed}tok/s`;
+						}
+					}
+				}
+			} catch (err) {
+				console.log(`Error from call_llm: ${err}`);
+				return null;
+			}
+		}
+
+		reset_btn.onclick = _ => {
+			messages = [];
+			prediction_speed = 0;
+			draw(messages);
+		}
+
+		let messages = [];
+		let prediction_speed = 0;
+		let n_ctx = await get_n_ctx();
+
+		status.innerHTML = `0/${n_ctx} ${prediction_speed}tok/s`;
+
+
+		// Handle TeX
+		// See https://github.com/ggml-org/llama.cpp/blob/8f8f227/tools/server/webui/src/components/MarkdownDisplay.tsx#L235
+		function preprocessLaTeX(content) {
+			// Step 1: Protect code blocks
+			const codeBlocks = [];
+			content = content.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (_, code) => {
+				codeBlocks.push(code);
+				return `<<CODE_BLOCK_${codeBlocks.length - 1}>>`;
+			});
+
+			// Step 2: Protect existing LaTeX expressions
+			const latexExpressions = [];
+
+			// Protect block math ($$...$$), \[...\], and \(...\) as before.
+			content = content.replace(
+				/(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\(.*?\\\))/g,
+				(match) => {
+					latexExpressions.push(match);
+					return `<<LATEX_${latexExpressions.length - 1}>>`;
+				}
+			);
+
+			// Protect inline math ($...$) only if it does NOT match a currency pattern.
+			// We assume a currency pattern is one where the inner content is purely numeric (with optional decimals).
+			content = content.replace(/\$([^$]+)\$/g, (match, inner) => {
+				if (/^\s*\d+(?:\.\d+)?\s*$/.test(inner)) {
+					// This looks like a currency value (e.g. "$123" or "$12.34"),
+					// so don't protect it.
+					return match;
+				} else {
+					// Otherwise, treat it as a LaTeX expression.
+					latexExpressions.push(match);
+					return `<<LATEX_${latexExpressions.length - 1}>>`;
+				}
+			});
+
+			// Step 3: Escape dollar signs that are likely currency indicators.
+			// (Now that inline math is protected, this will only escape dollars not already protected)
+			content = content.replace(/\$(?=\d)/g, '\\$');
+
+			// Step 4: Restore LaTeX expressions
+			content = content.replace(
+				/<<LATEX_(\d+)>>/g,
+				(_, index) => latexExpressions[parseInt(index)]
+			);
+
+			// Step 5: Restore code blocks
+			content = content.replace(
+				/<<CODE_BLOCK_(\d+)>>/g,
+				(_, index) => codeBlocks[parseInt(index)]
+			);
+
+			// Step 6: Apply additional escaping functions
+			content = escapeBrackets(content);
+			content = escapeMhchem(content);
+
+			return content;
+		}
+
+		function escapeBrackets(text) {
+			const pattern =
+				/(```[\S\s]*?```|`.*?`)|\\\[([\S\s]*?[^\\])\\]|\\\((.*?)\\\)/g;
+			return text.replace(
+				pattern,
+				(
+					match,
+					codeBlock,
+					squareBracket,
+					roundBracket
+				) => {
+					if (codeBlock != null) {
+						return codeBlock;
+					} else if (squareBracket != null) {
+						return `$$${squareBracket}$$`;
+					} else if (roundBracket != null) {
+						return `$${roundBracket}$`;
+					}
+					return match;
+				}
+			);
+		}
+
+		function escapeMhchem(text) {
+			return text.replaceAll('$\\ce{', '$\\\\ce{').replaceAll('$\\pu{', '$\\\\pu{');
+		}		
+	</script>
+</head>
+
+<body></body>
+
+</html>
