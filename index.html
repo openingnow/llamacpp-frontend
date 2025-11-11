@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Chat</title>
+	<style>
+		body {
+			max-width: 800px;
+			margin: auto;
+		}
+	</style>
+	<link href="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.css" rel="stylesheet">
+</head>
+
+<body>
+	<script type="module">
+		import * as rxjs from "https://esm.sh/rxjs@7.8";
+
+		const key_input = document.createElement('input');
+		const history = document.createElement('div');
+		const current_generation = document.createElement('div');
+		const query_area = document.createElement('textarea');
+		const btn_reset = document.createElement('button');
+		const btn_stop = document.createElement('button');
+		document.body.append(key_input, history, current_generation, query_area, btn_reset, ' ', btn_stop);
+
+		key_input.placeholder = 'OpenAI Key';
+		query_area.style.width = '100%';
+		btn_reset.textContent = 'Reset';
+		btn_stop.textContent = 'Stop';
+		btn_stop.disabled = true;
+
+		const env = Object.fromEntries([...new URLSearchParams(window.location.search)]);
+		env.stream = env.stream !== 'false';
+
+		const messages$ = new rxjs.BehaviorSubject([]);
+		messages$.subscribe(async mm => {
+			history.innerHTML = await Promise.all(mm.map(async m => `<h2>${m.role}</h2>${await md_to_html(m.content)}`)).then(a => a.join(''));
+		});
+
+		const generating$ = new rxjs.BehaviorSubject(false);
+		generating$.subscribe(b => {
+			document.title = b ? 'generating...' : 'Chat';
+			query_area.style.backgroundColor = b ? '#D3D3D3' : '';
+			btn_reset.disabled = b;
+			btn_stop.disabled = !b;
+		});
+
+		const decoder = new TextDecoder('utf-8');
+
+		const parse_reponse = j => {
+			const o = j.output.find(o => o.type === "message");
+			return { role: o.role, content: o.content[0].text }
+		}
+
+		query_area.onkeydown = async e => {
+			if (e.key !== 'Enter' || e.shiftKey || generating$.getValue()) return;
+
+			e.preventDefault();
+			const query_text = e.srcElement.value.trim();
+			if (!query_text) return;
+			const query = { role: 'user', content: query_text };
+
+			generating$.next(true);
+			const prediction = await (async _ => {
+				const abort_controller = new AbortController();
+				btn_stop.onclick = (_ => abort_controller.abort())
+
+				const response = await fetch((env.base || '') + '/v1/responses', {
+					method: 'POST',
+					headers: { Authorization: `Bearer ${key_input.value}`, 'Content-Type': 'application/json' },
+					signal: abort_controller.signal,
+					body: JSON.stringify({ input: [...messages$.getValue(), query], stream: env.stream, model: env.model })
+				}).catch(e => `${e}`);
+
+				if (typeof response === "string") return response;
+				if (!response.ok) return `HTTP error ${response.status}: ${await response.text()}`;
+
+				if (!env.stream) return parse_reponse(await response.json());
+
+				const reader = response.body.getReader();
+				let predicted_str = '';
+				while (true) {
+					const { done, value } = await reader.read().catch(e => ({ done: true, value: `${e}` }));
+					if (done) return "Unexpected termination from `reader.read()`";
+
+					for (const line of decoder.decode(value).split('\n')) {
+						if (!line.startsWith('data:')) continue;
+						const j = JSON.parse(line.slice(6));
+						if (j.type === 'response.completed') return parse_reponse(j.response);
+						if (j.type !== 'response.output_text.delta') continue;
+						const new_token = j.delta;
+						if (!new_token) continue;
+						predicted_str += new_token;
+						current_generation.innerHTML = await md_to_html(`## user\n${query_text}\n\n## assistant\n${predicted_str}`);
+					}
+				}
+			})();
+			generating$.next(false);
+
+			if (typeof prediction === "string") {
+				current_generation.innerHTML += prediction;
+				return;
+			}
+			messages$.next([...messages$.getValue(), query, prediction]);
+			e.srcElement.value = '';
+			current_generation.innerHTML = '';
+		}
+
+		btn_reset.onclick = (_ => { messages$.next([]); current_generation.innerHTML = ''; })
+
+		// https://github.com/ggml-org/llama.cpp/blob/master/tools/server/webui/src/lib/components/app/misc/MarkdownContent.svelte#L24
+		import { remark } from 'https://esm.sh/remark@15.0?bundle';
+		import remarkGfm from 'https://esm.sh/remark-gfm@4.0?bundle';
+		import remarkMath from 'https://esm.sh/remark-math@6.0?bundle';
+		import remarkBreaks from 'https://esm.sh/remark-breaks@4.0?bundle';
+		import remarkRehype from 'https://esm.sh/remark-rehype@11.1?bundle';
+		import rehypeKatex from 'https://esm.sh/rehype-katex@7.0?bundle';
+		import rehypeHighlight from 'https://esm.sh/rehype-highlight@7.0?bundle';
+		import rehypeStringify from 'https://esm.sh/rehype-stringify@10.0?bundle';
+		const processor = remark()
+			.use(remarkGfm) // GitHub Flavored Markdown
+			.use(remarkMath) // Parse $inline$ and $$block$$ math
+			.use(remarkBreaks) // Convert line breaks to <br>
+			.use(remarkRehype) // Convert to rehype (HTML AST)
+			.use(rehypeKatex) // Render math using KaTeX
+			.use(rehypeHighlight) // Add syntax highlighting
+			.use(rehypeStringify);
+		const md_to_html = async md => await processor.process(preprocessLaTeX(md));
+
+		// Handle TeX
+		// See https://github.com/ggml-org/llama.cpp/blob/8f8f227/tools/server/webui/src/components/MarkdownDisplay.tsx#L235
+		function preprocessLaTeX(content) {
+			// Step 1: Protect code blocks
+			const codeBlocks = [];
+			content = content.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (_, code) => {
+				codeBlocks.push(code);
+				return `<<CODE_BLOCK_${codeBlocks.length - 1}>>`;
+			});
+
+			// Step 2: Protect existing LaTeX expressions
+			const latexExpressions = [];
+
+			// Protect block math ($$...$$), \[...\], and \(...\) as before.
+			content = content.replace(
+				/(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\(.*?\\\))/g,
+				(match) => {
+					latexExpressions.push(match);
+					return `<<LATEX_${latexExpressions.length - 1}>>`;
+				}
+			);
+
+			// Protect inline math ($...$) only if it does NOT match a currency pattern.
+			// We assume a currency pattern is one where the inner content is purely numeric (with optional decimals).
+			content = content.replace(/\$([^$]+)\$/g, (match, inner) => {
+				if (/^\s*\d+(?:\.\d+)?\s*$/.test(inner)) {
+					// This looks like a currency value (e.g. "$123" or "$12.34"),
+					// so don't protect it.
+					return match;
+				} else {
+					// Otherwise, treat it as a LaTeX expression.
+					latexExpressions.push(match);
+					return `<<LATEX_${latexExpressions.length - 1}>>`;
+				}
+			});
+
+			// Step 3: Escape dollar signs that are likely currency indicators.
+			// (Now that inline math is protected, this will only escape dollars not already protected)
+			content = content.replace(/\$(?=\d)/g, '\\$');
+
+			// Step 4: Restore LaTeX expressions
+			content = content.replace(
+				/<<LATEX_(\d+)>>/g,
+				(_, index) => latexExpressions[parseInt(index)]
+			);
+
+			// Step 5: Restore code blocks
+			content = content.replace(
+				/<<CODE_BLOCK_(\d+)>>/g,
+				(_, index) => codeBlocks[parseInt(index)]
+			);
+
+			// Step 6: Apply additional escaping functions
+			content = escapeBrackets(content);
+			content = escapeMhchem(content);
+
+			return content;
+		}
+
+		function escapeBrackets(text) {
+			const pattern =
+				/(```[\S\s]*?```|`.*?`)|\\\[([\S\s]*?[^\\])\\]|\\\((.*?)\\\)/g;
+			return text.replace(
+				pattern,
+				(
+					match,
+					codeBlock,
+					squareBracket,
+					roundBracket
+				) => {
+					if (codeBlock != null) {
+						return codeBlock;
+					} else if (squareBracket != null) {
+						return `$$${squareBracket}$$`;
+					} else if (roundBracket != null) {
+						return `$${roundBracket}$`;
+					}
+					return match;
+				}
+			);
+		}
+
+		function escapeMhchem(text) {
+			return text.replaceAll('$\\ce{', '$\\\\ce{').replaceAll('$\\pu{', '$\\\\pu{');
+		}		
+	</script>
+</body>
+
+</html>
